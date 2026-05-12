@@ -1,0 +1,96 @@
+#include <Wire.h>
+
+#define MPU 0x68
+#define GYRO_SENSITIVITY 131.0
+
+int16_t GyX, GyY, GyZ;
+float pitch = 0, roll = 0, yaw = 0;
+unsigned long lastTime;
+float deltaTime;
+float gyroOffsetX = 0, gyroOffsetY = 0, gyroOffsetZ = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  Wire.setClock(400000);
+  
+  // Inicializar MPU6050
+  Wire.beginTransmission(MPU);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  
+  // Configurar giroscopio
+  Wire.beginTransmission(MPU);
+  Wire.write(0x1B);
+  Wire.write(0x00);  // ±250°/s
+  Wire.endTransmission();
+  
+  Serial.println("MPU6050 - Modo Giroscopio");
+  calibrateGyro();
+  
+  lastTime = micros();
+}
+
+void loop() {
+  // Calcular delta time
+  unsigned long currentTime = micros();
+  deltaTime = (currentTime - lastTime) / 1000000.0;
+  lastTime = currentTime;
+  
+  // Leer giroscopio
+  Wire.beginTransmission(MPU);
+  Wire.write(0x43);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU, 6, true);
+  
+  GyX = Wire.read() << 8 | Wire.read();
+  GyY = Wire.read() << 8 | Wire.read();
+  GyZ = Wire.read() << 8 | Wire.read();
+  
+  // Convertir a grados/segundo y aplicar offset
+  float gyroX = (GyX / GYRO_SENSITIVITY) - gyroOffsetX;
+  float gyroY = (GyY / GYRO_SENSITIVITY) - gyroOffsetY;
+  float gyroZ = (GyZ / GYRO_SENSITIVITY) - gyroOffsetZ;
+  
+  // Integrar
+  pitch += gyroX * deltaTime;
+  roll += gyroY * deltaTime;
+  yaw += gyroZ * deltaTime;
+  
+  Serial.print("Pitch: ");
+  Serial.print(pitch);
+  Serial.print(" Roll: ");
+  Serial.print(roll);
+  Serial.print(" Yaw: ");
+  Serial.println(yaw);
+  
+  delay(50);
+}
+
+void calibrateGyro() {
+  Serial.println("Calibrando... mantén quieto");
+  delay(2000);
+  
+  float sumX = 0, sumY = 0, sumZ = 0;
+  int samples = 200;
+  
+  for (int i = 0; i < samples; i++) {
+    Wire.beginTransmission(MPU);
+    Wire.write(0x43);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU, 6, true);
+    
+    sumX += (Wire.read() << 8 | Wire.read()) / GYRO_SENSITIVITY;
+    sumY += (Wire.read() << 8 | Wire.read()) / GYRO_SENSITIVITY;
+    sumZ += (Wire.read() << 8 | Wire.read()) / GYRO_SENSITIVITY;
+    
+    delay(5);
+  }
+  
+  gyroOffsetX = sumX / samples;
+  gyroOffsetY = sumY / samples;
+  gyroOffsetZ = sumZ / samples;
+  
+  Serial.println("Calibración completa!");
+}
