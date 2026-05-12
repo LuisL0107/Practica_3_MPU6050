@@ -1,0 +1,352 @@
+/**
+ * MPU6050 - Cálculo de Pitch y Roll con Acelerómetro
+ * Arduino Mega 2560
+ * 
+ * Este código aplica un FILTRO PASA BAJAS a los datos del acelerómetro
+ * para eliminar ruido de alta frecuencia y vibraciones.
+ * 
+ * Conexiones:
+ * Mega 5V    -> MPU6050 VCC
+ * Mega GND   -> MPU6050 GND
+ * Mega SDA20 -> MPU6050 SDA
+ * Mega SCL21 -> MPU6050 SCL
+ */
+
+#include <Wire.h>
+
+// Dirección I2C del MPU6050
+#define MPU6050_ADDR 0x68
+
+// Factores de conversión
+#define ACCEL_SENSITIVITY 16384.0  // Para rango ±2g
+#define RAD_TO_DEG 57.29578  // 180/PI
+
+// Parámetros del filtro pasa bajas
+#define LOW_PASS_CUTOFF 5.0     // Frecuencia de corte en Hz (ajustable)
+#define SAMPLE_RATE 100.0        // Tasa de muestreo aproximada en Hz
+
+// Estructura para almacenar datos del acelerómetro
+struct AccelData {
+  int16_t rawX;
+  int16_t rawY;
+  int16_t rawZ;
+  float gX;           // Valor en gravedades (sin filtrar)
+  float gY;
+  float gZ;
+  float filteredX;    // Valor filtrado (pasa bajas)
+  float filteredY;
+  float filteredZ;
+};
+
+// Estructura para ángulos calculados
+struct Angles {
+  float pitch;        // Calculado con datos sin filtrar
+  float roll;
+  float filteredPitch; // Calculado con datos filtrados
+  float filteredRoll;
+};
+
+// Variables globales
+AccelData accel;
+Angles angles;
+unsigned long lastReadTime = 0;
+const int readInterval = 10;  // 100 lecturas por segundo (10ms)
+
+// Variables para filtro pasa bajas (filtro RC digital)
+float lpfAlpha;  // Coeficiente del filtro
+float prevFilteredX = 0, prevFilteredY = 0, prevFilteredZ = 0;
+
+// Offset de calibración
+const int16_t OFFSET_X = 0;
+const int16_t OFFSET_Y = 0;
+const int16_t OFFSET_Z = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println(F("Inicializando MPU6050 en Arduino Mega..."));
+  Serial.println(F("Aplicando FILTRO PASA BAJAS al acelerómetro"));
+  
+  // Iniciar comunicación I2C
+  Wire.begin();
+  Wire.setClock(400000);  // Modo rápido para Mega
+  
+  // Verificar conexión
+  if (!initializeMPU6050()) {
+    Serial.println(F("ERROR: No se pudo inicializar el MPU6050"));
+    while(1);
+  }
+  
+  // Calcular coeficiente del filtro pasa bajas
+  calculateFilterCoefficient();
+  
+  Serial.println(F("MPU6050 inicializado correctamente"));
+  Serial.println(F("--- Comparación: Datos sin filtrar vs Filtrados ---"));
+  Serial.println(F("Tiempo(ms)\tPitch raw\tRoll raw\tPitch filt\tRoll filt\tEstado"));
+  Serial.println(F("------------------------------------------------------------------------"));
+}
+
+void loop() {
+  // Control de tiempo de lectura
+  if (millis() - lastReadTime >= readInterval) {
+    lastReadTime = millis();
+    
+    // Leer datos del acelerómetro
+    if (readAccelerometer()) {
+      // Convertir a gravedades
+      convertToG();
+      
+      // APLICAR FILTRO PASA BAJAS
+      applyLowPassFilter();
+      
+      // Calcular ángulos (con datos sin filtrar y filtrados)
+      calculateAngles();
+      
+      // Mostrar resultados comparativos
+      displayResults();
+    } else {
+      Serial.println(F("Error al leer el sensor"));
+    }
+  }
+  
+  // Pequeña pausa
+  delay(1);
+}
+
+/**
+ * Inicializa el MPU6050
+ */
+bool initializeMPU6050() {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B);  // Registro PWR_MGMT_1
+  Wire.write(0x00);  // Despertar el sensor
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+  
+  // Configurar rango del acelerómetro a ±2g
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1C);  // Registro ACCEL_CONFIG
+  Wire.write(0x00);  // 00 = ±2g
+  Wire.endTransmission();
+  
+  // Configurar filtro interno del MPU6050
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1A);  // Registro CONFIG
+  Wire.write(0x06);  // Filtro pasa bajos interno a 5Hz (DLPF_CFG = 6)
+  Wire.endTransmission();
+  
+  delay(100);
+  return true;
+}
+
+/**
+ * Calcula el coeficiente para el filtro pasa bajas digital
+ * Filtro RC de primer orden: alpha = dt / (RC + dt)
+ * donde RC = 1/(2*π*fc)
+ */
+void calculateFilterCoefficient() {
+  float dt = 1.0 / SAMPLE_RATE;  // Tiempo entre muestras
+  float RC = 1.0 / (2.0 * PI * LOW_PASS_CUTOFF);  // Constante de tiempo
+  lpfAlpha = dt / (RC + dt);  // Coeficiente del filtro
+  
+  Serial.print(F("Filtro pasa bajas - Frecuencia corte: "));
+  Serial.print(LOW_PASS_CUTOFF);
+  Serial.print(F(" Hz, Alpha: "));
+  Serial.println(lpfAlpha, 4);
+}
+
+/**
+ * Lee los valores brutos del acelerómetro
+ */
+bool readAccelerometer() {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x3B);  // Registro ACCEL_XOUT_H
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+  
+  if (Wire.requestFrom(MPU6050_ADDR, 6, true) != 6) {
+    return false;
+  }
+  
+  accel.rawX = Wire.read() << 8 | Wire.read();
+  accel.rawY = Wire.read() << 8 | Wire.read();
+  accel.rawZ = Wire.read() << 8 | Wire.read();
+  
+  return true;
+}
+
+/**
+ * Convierte valores brutos a gravedades (g)
+ */
+void convertToG() {
+  // Aplicar offset de calibración
+  int16_t calibratedX = accel.rawX - OFFSET_X;
+  int16_t calibratedY = accel.rawY - OFFSET_Y;
+  int16_t calibratedZ = accel.rawZ - OFFSET_Z;
+  
+  // Convertir a g
+  accel.gX = calibratedX / ACCEL_SENSITIVITY;
+  accel.gY = calibratedY / ACCEL_SENSITIVITY;
+  accel.gZ = calibratedZ / ACCEL_SENSITIVITY;
+}
+
+/**
+ * APLICA FILTRO PASA BAJAS a los datos del acelerómetro
+ * 
+ * Filtro digital de primer orden (similar a filtro RC analógico):
+ * y[n] = α * x[n] + (1-α) * y[n-1]
+ * 
+ * donde α = dt/(RC+dt) es el coeficiente de suavizado
+ * 
+ * Este filtro elimina el ruido de alta frecuencia (vibraciones)
+ * pero introduce un pequeño retardo en la respuesta.
+ */
+void applyLowPassFilter() {
+  // Aplicar filtro a cada eje
+  // filtered = alpha * newValue + (1-alpha) * previousFiltered
+  
+  // Eje X
+  accel.filteredX = lpfAlpha * accel.gX + (1 - lpfAlpha) * prevFilteredX;
+  
+  // Eje Y
+  accel.filteredY = lpfAlpha * accel.gY + (1 - lpfAlpha) * prevFilteredY;
+  
+  // Eje Z
+  accel.filteredZ = lpfAlpha * accel.gZ + (1 - lpfAlpha) * prevFilteredZ;
+  
+  // Guardar para próxima iteración
+  prevFilteredX = accel.filteredX;
+  prevFilteredY = accel.filteredY;
+  prevFilteredZ = accel.filteredZ;
+}
+
+/**
+ * Versión alternativa: Filtro de media móvil (Moving Average)
+ * Más simple pero requiere más memoria
+ */
+void applyMovingAverageFilter() {
+  const int WINDOW_SIZE = 10;
+  static float bufferX[WINDOW_SIZE], bufferY[WINDOW_SIZE], bufferZ[WINDOW_SIZE];
+  static int index = 0;
+  static float sumX = 0, sumY = 0, sumZ = 0;
+  static int count = 0;
+  
+  // Restar el valor más antiguo del buffer
+  sumX -= bufferX[index];
+  sumY -= bufferY[index];
+  sumZ -= bufferZ[index];
+  
+  // Agregar nuevo valor
+  bufferX[index] = accel.gX;
+  bufferY[index] = accel.gY;
+  bufferZ[index] = accel.gZ;
+  
+  sumX += bufferX[index];
+  sumY += bufferY[index];
+  sumZ += bufferZ[index];
+  
+  index = (index + 1) % WINDOW_SIZE;
+  if (count < WINDOW_SIZE) count++;
+  
+  // Promedio
+  accel.filteredX = sumX / count;
+  accel.filteredY = sumY / count;
+  accel.filteredZ = sumZ / count;
+}
+
+/**
+ * Calcula ángulos Pitch y Roll usando acelerómetro
+ * Tanto con datos sin filtrar como filtrados
+ */
+void calculateAngles() {
+  // Ángulos con datos SIN FILTRAR
+  angles.pitch = atan2(accel.gX, sqrt(accel.gY * accel.gY + accel.gZ * accel.gZ)) * RAD_TO_DEG;
+  angles.roll = atan2(accel.gY, sqrt(accel.gX * accel.gX + accel.gZ * accel.gZ)) * RAD_TO_DEG;
+  
+  // Ajustar rango para Roll (datos sin filtrar)
+  if (accel.gZ < 0) {
+    if (angles.roll > 0) {
+      angles.roll = 180 - angles.roll;
+    } else {
+      angles.roll = -180 - angles.roll;
+    }
+  }
+  
+  // Ángulos con datos FILTRADOS
+  angles.filteredPitch = atan2(accel.filteredX, sqrt(accel.filteredY * accel.filteredY + accel.filteredZ * accel.filteredZ)) * RAD_TO_DEG;
+  angles.filteredRoll = atan2(accel.filteredY, sqrt(accel.filteredX * accel.filteredX + accel.filteredZ * accel.filteredZ)) * RAD_TO_DEG;
+  
+  // Ajustar rango para Roll (datos filtrados)
+  if (accel.filteredZ < 0) {
+    if (angles.filteredRoll > 0) {
+      angles.filteredRoll = 180 - angles.filteredRoll;
+    } else {
+      angles.filteredRoll = -180 - angles.filteredRoll;
+    }
+  }
+}
+
+/**
+ * Muestra los resultados comparativos
+ */
+void displayResults() {
+  // Determinar estado (detección de movimiento)
+  float totalAccel = sqrt(accel.gX * accel.gX + accel.gY * accel.gY + accel.gZ * accel.gZ);
+  const char* status = "Estable";
+  if (abs(totalAccel - 1.0) > 0.2) {
+    status = "Movimiento";
+  }
+  
+  // Mostrar en monitor serie
+  Serial.print(millis());
+  Serial.print("\t");
+  Serial.print(angles.pitch, 2);
+  Serial.print("\t\t");
+  Serial.print(angles.roll, 2);
+  Serial.print("\t\t");
+  Serial.print(angles.filteredPitch, 2);
+  Serial.print("\t\t");
+  Serial.print(angles.filteredRoll, 2);
+  Serial.print("\t\t");
+  Serial.println(status);
+}
+
+/**
+ * Función para visualizar el efecto del filtro
+ */
+void visualizeFilterEffect() {
+  static int counter = 0;
+  counter++;
+  
+  if (counter % 50 == 0) {  // Cada 50 lecturas
+    Serial.println(F("\n--- EFECTO DEL FILTRO PASA BAJAS ---"));
+    Serial.print(F("Eje X - Raw: "));
+    Serial.print(accel.gX, 3);
+    Serial.print(F(" g, Filtered: "));
+    Serial.print(accel.filteredX, 3);
+    Serial.println(F(" g"));
+    
+    Serial.print(F("Eje Y - Raw: "));
+    Serial.print(accel.gY, 3);
+    Serial.print(F(" g, Filtered: "));
+    Serial.print(accel.filteredY, 3);
+    Serial.println(F(" g"));
+    
+    Serial.print(F("Eje Z - Raw: "));
+    Serial.print(accel.gZ, 3);
+    Serial.print(F(" g, Filtered: "));
+    Serial.print(accel.filteredZ, 3);
+    Serial.println(F(" g"));
+    
+    // Calcular reducción de ruido
+    float noiseRaw = abs(accel.gX - 0);  // Asumiendo que debería ser 0
+    float noiseFilt = abs(accel.filteredX - 0);
+    float reduction = (1 - noiseFilt/noiseRaw) * 100;
+    
+    Serial.print(F("Reducción de ruido: ~"));
+    Serial.print(reduction, 1);
+    Serial.println(F("%"));
+    Serial.println(F("------------------------------------\n"));
+  }
+}
