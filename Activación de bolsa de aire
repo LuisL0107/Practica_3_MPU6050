@@ -1,0 +1,220 @@
+#include <Wire.h>
+#include <MPU6050.h>
+
+MPU6050 mpu;
+
+// Pines de salida
+const int AIRBAG_PIN = 9;     // Pin para activar la bolsa de aire (LED o relé)
+const int LED_STATUS_PIN = 13; // LED de estado integrado en Arduino UNO
+
+// Variables para filtro complementario
+float accX, accY, accZ;
+float gyroX, gyroY, gyroZ;
+float angleX = 0, angleY = 0;
+unsigned long lastTime = 0;
+
+// Variables para detección de impacto
+const float IMPACT_THRESHOLD = 3;  // Umbral de desaceleración en g (ajustar según necesidad)
+const int DEBOUNCE_TIME = 100;        // Tiempo de antirebote en milisegundos
+bool airbagActivated = false;
+unsigned long lastImpactTime = 0;
+
+// Variables para calibración
+float accBiasX = 0, accBiasY = 0, accBiasZ = 0;
+const int CALIBRATION_SAMPLES = 500;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  
+  // Configurar pines
+  pinMode(AIRBAG_PIN, OUTPUT);
+  pinMode(LED_STATUS_PIN, OUTPUT);
+  
+  // Inicializar MPU6050
+  Serial.println("Inicializando MPU6050...");
+  mpu.initialize();
+  
+  // Verificar conexión
+  if (mpu.testConnection()) {
+    Serial.println("MPU6050 conectado correctamente");
+    digitalWrite(LED_STATUS_PIN, HIGH);
+    delay(1000);
+    digitalWrite(LED_STATUS_PIN, LOW);
+  } else {
+    Serial.println("Error: MPU6050 no encontrado");
+    digitalWrite(LED_STATUS_PIN, HIGH);
+    while(1) delay(100); // Detener ejecución si no hay sensor
+  }
+  
+  // Calibrar acelerómetro
+  calibrateAccelerometer();
+  
+  // Configurar el MPU6050
+  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+  
+  lastTime = micros();
+  Serial.println("Sistema de bolsa de aire listo");
+  Serial.println("Umbral de impacto: +/-" + String(IMPACT_THRESHOLD) + "g");
+}
+
+void loop() {
+  // Leer datos del MPU6050
+  readMPUData();
+  
+  // Calcular aceleración total en g
+  float totalAccel = sqrt(accX * accX + accY * accY + accZ * accZ);
+  
+  // Calcular desaceleración (cambio en aceleración)
+  static float lastTotalAccel = 0;
+  float deceleration = lastTotalAccel - totalAccel;
+  lastTotalAccel = totalAccel;
+  
+  // Detectar impacto si la bolsa no está activada
+  if (!airbagActivated && (totalAccel > IMPACT_THRESHOLD || totalAccel < -IMPACT_THRESHOLD)) {
+    unsigned long currentTime = millis();
+    
+    // Antirebote
+    if (currentTime - lastImpactTime > DEBOUNCE_TIME) {
+      Serial.println("*** IMPACTO DETECTADO ***");
+      Serial.print("Aceleración: ");
+      Serial.print(totalAccel);
+      Serial.println(" g");
+      
+      activateAirbag();
+      lastImpactTime = currentTime;
+    }
+  }
+  
+  // Monitorear desaceleración brusca (similar a frenado de choque)
+  if (!airbagActivated && abs(deceleration) > IMPACT_THRESHOLD * 0.8) {
+    Serial.print("Desaceleración brusca detectada: ");
+    Serial.print(deceleration);
+    Serial.println(" g");
+    
+    // Si la desaceleración es muy severa, activar
+    if (abs(deceleration) > IMPACT_THRESHOLD * 1.2) {
+      activateAirbag();
+    }
+  }
+  
+  // Mostrar datos por serial (para monitoreo)
+  static unsigned long lastSerialPrint = 0;
+  if (millis() - lastSerialPrint > 500 && !airbagActivated) {
+    Serial.print("Aceleración total: ");
+    Serial.print(totalAccel);
+    Serial.print(" g | Desaceleración: ");
+    Serial.print(deceleration);
+    Serial.println(" g");
+    lastSerialPrint = millis();
+  }
+  
+  delay(10); // Pequeña pausa para estabilidad
+}
+
+void readMPUData() {
+  // Leer acelerómetro y giroscopio
+  int16_t ax, ay, az;
+  int16_t gx, gy, gz;
+  
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+  
+  // Convertir a unidades físicas
+  // Acelerómetro: 16384 LSB/g (para rango ±2g)
+  accX = (ax / 16384.0) - accBiasX;
+  accY = (ay / 16384.0) - accBiasY;
+  accZ = (az / 16384.0) - accBiasZ;
+  
+  // Giroscopio: 131 LSB/°/s (para rango ±250°/s)
+  gyroX = gx / 131.0;
+  gyroY = gy / 131.0;
+  gyroZ = gz / 131.0;
+  
+  // Filtro complementario para ángulo (opcional)
+  unsigned long now = micros();
+  float dt = (now - lastTime) / 1000000.0;
+  lastTime = now;
+  
+  if (dt > 0 && dt < 0.1) {
+    // Calcular ángulo por integración del giroscopio
+    angleX += gyroX * dt;
+    angleY += gyroY * dt;
+    
+    // Calcular ángulo por acelerómetro
+    float accAngleX = atan2(accY, accZ) * 180 / PI;
+    float accAngleY = atan2(-accX, sqrt(accY*accY + accZ*accZ)) * 180 / PI;
+    
+    // Aplicar filtro complementario
+    const float alpha = 0.96;
+    angleX = alpha * (angleX + gyroX * dt) + (1 - alpha) * accAngleX;
+    angleY = alpha * (angleY + gyroY * dt) + (1 - alpha) * accAngleY;
+  }
+}
+
+void calibrateAccelerometer() {
+  Serial.println("Calibrando acelerómetro...");
+  Serial.println("Asegúrese de que el sensor esté estático y nivelado");
+  
+  float sumX = 0, sumY = 0, sumZ = 0;
+  
+  for (int i = 0; i < CALIBRATION_SAMPLES; i++) {
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    
+    sumX += ax / 16384.0;
+    sumY += ay / 16384.0;
+    sumZ += az / 16384.0;
+    
+    delay(5);
+  }
+  
+  accBiasX = sumX / CALIBRATION_SAMPLES;
+  accBiasY = sumY / CALIBRATION_SAMPLES;
+  accBiasZ = (sumZ / CALIBRATION_SAMPLES) - 1.0; // Restar 1g para el eje Z
+  
+  Serial.println("Calibración completada");
+  Serial.print("Offset X: "); Serial.println(accBiasX);
+  Serial.print("Offset Y: "); Serial.println(accBiasY);
+  Serial.print("Offset Z: "); Serial.println(accBiasZ);
+  
+  delay(1000);
+}
+
+void activateAirbag() {
+  if (!airbagActivated) {
+    airbagActivated = true;
+    
+    // Activar la bolsa de aire (PIN alto)
+    digitalWrite(AIRBAG_PIN, HIGH);
+    digitalWrite(LED_STATUS_PIN, HIGH);
+    
+    Serial.println("!!! BOLSA DE AIRE ACTIVADA !!!");
+    
+    // Simulación de secuencia de activación
+    for (int i = 0; i < 5; i++) {
+      digitalWrite(LED_STATUS_PIN, !digitalRead(LED_STATUS_PIN));
+      delay(100);
+    }
+    
+    // Mantener activada la bolsa de aire
+    digitalWrite(AIRBAG_PIN, HIGH);
+    digitalWrite(LED_STATUS_PIN, HIGH);
+    
+    // También podrías agregar aquí código para:
+    // - Enviar señal a un módulo GSM para emergencia
+    // - Registrar datos del evento en EEPROM
+    // - Activar una alarma sonora
+  }
+}
+
+// Función para reiniciar el sistema después de un impacto
+void resetAirbagSystem() {
+  if (airbagActivated) {
+    airbagActivated = false;
+    digitalWrite(AIRBAG_PIN, LOW);
+    digitalWrite(LED_STATUS_PIN, LOW);
+    Serial.println("Sistema reiniciado - Listo para nuevo impacto");
+  }
+}     Codigo de bolsa de aire corregido
