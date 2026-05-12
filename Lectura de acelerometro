@@ -1,0 +1,54 @@
+#include <Wire.h>
+
+#define MPU 0x68
+#define RAD_TO_DEG 57.29578
+
+int16_t AcX, AcY, AcZ;
+float pitch, roll;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  Wire.setClock(400000);
+  
+  // Inicializar MPU6050
+  Wire.beginTransmission(MPU);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  
+  Serial.println("MPU6050 Listo!");
+  Serial.println("Pitch\tRoll");
+}
+
+void loop() {
+  // Leer acelerómetro
+  Wire.beginTransmission(MPU);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU, 6, true);
+  
+  AcX = Wire.read() << 8 | Wire.read();
+  AcY = Wire.read() << 8 | Wire.read();
+  AcZ = Wire.read() << 8 | Wire.read();
+  
+  // Convertir a g y calcular ángulos
+  float Ax = AcX / 16384.0;
+  float Ay = AcY / 16384.0;
+  float Az = AcZ / 16384.0;
+  
+  pitch = atan(Ax / sqrt(Ay*Ay + Az*Az)) * RAD_TO_DEG;
+  roll = atan(Ay / sqrt(Ax*Ax + Az*Az)) * RAD_TO_DEG;
+  
+  // Ajustar rango
+  if (Az < 0) {
+    if (roll > 0) roll = 180 - roll;
+    else roll = -180 - roll;
+  }
+  
+  Serial.print(pitch);
+  Serial.print("\t");
+  Serial.println(roll);
+  
+  delay(100);
+}
