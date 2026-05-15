@@ -1,0 +1,189 @@
+#include <Wire.h>
+#include <MPU6050.h>  // Biblioteca: "MPU6050 by Electronic Cats" en Library Manager
+
+MPU6050 mpu;
+
+// ===================== CONFIGURACIÓN =====================
+const float MASA_KG      = 0.5;    // <-- Cambia esto por la masa real de tu objeto (kg)
+const float DIST_MIN_CM  = 3.0;    // Distancia mínima del ejercicio
+const float DIST_MAX_CM  = 10.0;   // Distancia máxima del ejercicio
+const int   REPETICIONES = 10;     // Número de repeticiones pedidas
+const float UMBRAL_ACCEL = 0.3;    // m/s² mínimo para detectar movimiento (filtra ruido)
+const float G            = 9.81;   // m/s²
+
+
+// Variables globales
+int    repeticion       = 0;
+bool   midiendo         = false;
+float  ax_offset        = 0, ay_offset = 0, az_offset = 0;
+
+// Variables de integración
+float  velocidad        = 0;
+float  distancia_m      = 0;
+float  fuerza_max       = 0;
+unsigned long t_anterior = 0;
+
+// Resultados por repetición
+float fuerzas[REPETICIONES];
+float distancias[REPETICIONES];
+
+// ─────────────────────────────────────────
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  mpu.initialize();
+
+  if (!mpu.testConnection()) {
+    Serial.println("ERROR: MPU-6050 no encontrado. Revisa conexiones.");
+    while (true);
+  }
+
+  Serial.println("=== PRÁCTICA: FUERZA AL EMPUJAR UN OBJETO ===");
+  Serial.println("MPU-6050 encontrado correctamente.");
+  Serial.println("Calibrando sensor... mantén el sensor QUIETO 3 segundos.");
+  delay(3000);
+  calibrar();
+
+  Serial.println("Calibración lista.\n");
+  Serial.print("Masa del objeto: "); Serial.print(MASA_KG); Serial.println(" kg");
+  Serial.print("Distancia objetivo: "); Serial.print(DIST_MIN_CM);
+  Serial.print(" - "); Serial.print(DIST_MAX_CM); Serial.println(" cm");
+  Serial.println("----------------------------------------------");
+  instrucciones();
+}
+
+// ─────────────────────────────────────────
+void loop() {
+
+  // Leer aceleración 
+  int16_t ax_raw, ay_raw, az_raw, gx, gy, gz;
+  mpu.getMotion6(&ax_raw, &ay_raw, &az_raw, &gx, &gy, &gz);
+
+  // Convertir a m/s² y restar offset de calibración
+  float ax = (ax_raw / 16384.0) * G - ax_offset;
+  float ay = (ay_raw / 16384.0) * G - ay_offset;
+  float az = (az_raw / 16384.0) * G - az_offset;
+
+  // Magnitud de aceleración 
+  float a_total = sqrt(ax*ax + ay*ay + az*az);
+
+  unsigned long t_actual = millis();
+  float dt = (t_actual - t_anterior) / 1000.0;  // segundos
+  t_anterior = t_actual;
+
+  // ── DETECTAR INICIO de empuje ──
+  if (!midiendo && a_total > UMBRAL_ACCEL) {
+    midiendo    = true;
+    velocidad   = 0;
+    distancia_m = 0;
+    fuerza_max  = 0;
+    Serial.print("\n[Rep ");
+    Serial.print(repeticion + 1);
+    Serial.println("] Movimiento detectado, midiendo...");
+  }
+
+  // ── MIENTRAS SE ESTÁ MIDIENDO ──
+  if (midiendo) {
+    // Integración numérica (método de Euler)
+    velocidad   += a_total * dt;
+    distancia_m += velocidad * dt;
+
+    // Calcular fuerza instantánea F = m*a
+    float fuerza_inst = MASA_KG * a_total;
+    if (fuerza_inst > fuerza_max) fuerza_max = fuerza_inst;
+
+    float distancia_cm = distancia_m * 100.0;
+
+    // ── DETECTAR FIN: movimiento detuvo Y distancia en rango ──
+    if (a_total < UMBRAL_ACCEL * 0.5) {
+
+      midiendo = false;
+
+      Serial.print("  Distancia estimada : ");
+      Serial.print(distancia_cm, 2); Serial.println(" cm");
+      Serial.print("  Fuerza máxima      : ");
+      Serial.print(fuerza_max, 4); Serial.println(" N");
+
+      // Validar rango de distancia
+      if (distancia_cm >= DIST_MIN_CM && distancia_cm <= DIST_MAX_CM) {
+        fuerzas[repeticion]    = fuerza_max;
+        distancias[repeticion] = distancia_cm;
+        repeticion++;
+        Serial.println("  ✔ Repetición válida registrada.");
+      } else {
+        Serial.print("  ✘ Distancia fuera del rango (");
+        Serial.print(DIST_MIN_CM); Serial.print("-");
+        Serial.print(DIST_MAX_CM); Serial.println(" cm). Repite el empuje.");
+      }
+
+      // ── ¿Terminamos todas las repeticiones? ──
+      if (repeticion >= REPETICIONES) {
+        mostrarResumen();
+        while (true);  // Detener el programa
+      } else {
+        delay(1500);   // Pausa antes de la siguiente
+        instrucciones();
+      }
+    }
+  }
+
+  delay(10);  // Frecuencia de muestreo ~100 Hz
+}
+
+// ─────────────────────────────────────────
+void calibrar() {
+  const int N = 200;
+  long sum_ax = 0, sum_ay = 0, sum_az = 0;
+  int16_t ax_r, ay_r, az_r, gx, gy, gz;
+
+  for (int i = 0; i < N; i++) {
+    mpu.getMotion6(&ax_r, &ay_r, &az_r, &gx, &gy, &gz);
+    sum_ax += ax_r;
+    sum_ay += ay_r;
+    sum_az += az_r;
+    delay(5);
+  }
+
+  ax_offset = ((float)sum_ax / N / 16384.0) * G;
+  ay_offset = ((float)sum_ay / N / 16384.0) * G;
+  az_offset = ((float)sum_az / N / 16384.0) * G;
+}
+
+// ─────────────────────────────────────────
+void instrucciones() {
+  Serial.print(">>> Repetición ");
+  Serial.print(repeticion + 1);
+  Serial.print(" de ");
+  Serial.print(REPETICIONES);
+  Serial.println(": Empuja el objeto entre 3 y 10 cm...");
+}
+
+// ─────────────────────────────────────────
+void mostrarResumen() {
+  Serial.println("\n══════════════════════════════════════");
+  Serial.println("         RESUMEN DE RESULTADOS         ");
+  Serial.println("══════════════════════════════════════");
+  Serial.println("Rep | Distancia (cm) | Fuerza (N)");
+  Serial.println("----+----------------+-----------");
+
+  float suma_f = 0, suma_d = 0;
+  for (int i = 0; i < REPETICIONES; i++) {
+    Serial.print("  ");
+    Serial.print(i + 1);
+    Serial.print("  |      ");
+    Serial.print(distancias[i], 2);
+    Serial.print("      |   ");
+    Serial.println(fuerzas[i], 4);
+    suma_f += fuerzas[i];
+    suma_d += distancias[i];
+  }
+
+  Serial.println("----+----------------+-----------");
+  Serial.print("PROM|      ");
+  Serial.print(suma_d / REPETICIONES, 2);
+  Serial.print("      |   ");
+  Serial.println(suma_f / REPETICIONES, 4);
+  Serial.println("══════════════════════════════════════");
+  Serial.println("Práctica finalizada. Abre el Serial Plotter");
+  Serial.println("para analizar los datos si lo deseas.");
+}
